@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Refresh the live Earth wallpaper frames
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Timer]
+# Give the session a moment to settle after login, then keep the frames
+# current.  The terminator moves 0.25 degrees per minute, so five minutes
+# is far finer than the eye can notice.
+OnStartupSec=20
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

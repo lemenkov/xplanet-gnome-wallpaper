@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Render live Earth wallpaper frames (xplanet + NASA VIIRS)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/xplanet-wall-render
+Nice=10
+IOSchedulingClass=idle
+# A refresh that could not produce frames (offline, GIBS down) is not a
+# failure: the previous frames stay on screen.
+SuccessExitStatus=0 1

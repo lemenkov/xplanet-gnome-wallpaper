@@ -1,0 +1,860 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov
+# SPDX-License-Identifier: Apache-2.0
+
+"""Render a live satellite view of Earth as the GNOME desktop background.
+
+Downloads the latest global true-colour mosaic (NASA GIBS, VIIRS/SNPP),
+fills coverage gaps with Blue Marble, and renders one xplanet frame per
+distinct logical monitor size.  Frames are published atomically under
+
+    ~/.cache/xplanet-wall/frames/<WIDTH>x<HEIGHT>/<epoch>.png
+
+The companion GNOME Shell extension picks up the newest frame per monitor
+and applies it with Meta.Background.set_file().
+
+A live satellite layer draws the ISS (or any NORAD IDs listed in the
+config) on the globe: the current sub-satellite marker with height and
+speed, a ground track spanning one orbit, and the horizon footprint.
+Orbital positions come from the SGP4 propagator built into xplanet, using
+TLEs fetched from Celestrak and cached for a few hours.
+
+Everything is cached: the mosaic once per available date, the resized
+night map once per mosaic size, and the TLEs per catalogue number.
+Re-running is cheap and idempotent.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+# --- defaults -------------------------------------------------------------
+
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "xplanet-wall")
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "xplanet-wall", "config")
+
+DEFAULT_CONFIG = {
+    # Where the observer looks.  "auto" follows the system time zone, which
+    # keeps your own hemisphere centred as the day/night line sweeps past.
+    "longitude": "auto",
+    "latitude": "20",
+    # Globe diameter as a fraction of the monitor's shorter side.
+    "scale": "0.90",
+    # Frames kept per monitor size (2 is enough for a crossfade).
+    "keep": "2",
+    # Set to 0 to disable the NASA download and always use Blue Marble.
+    "use_viirs": "1",
+    # Days to scan back when looking for the newest available mosaic.
+    "max_age_days": "12",
+    # Reject a mosaic whose no-data fraction exceeds this (a partially
+    # ingested day can miss a whole hemisphere), and look further back.
+    "max_holes": "0.30",
+    "max_candidates": "4",
+    # How long to distrust a rejected date before trying it again.
+    "bad_ttl_hours": "6",
+    # Fixed monitor sizes as WxH,WxH (skips the Mutter query when set).
+    "monitors": "",
+    # NORAD catalogue numbers to draw, comma separated.  25544 is the ISS;
+    # 48274 (Tiangong) and 20580 (Hubble) also work.  Empty disables the
+    # satellite layer.
+    "satellites": "25544",
+    # How to show the orbit: "ground" (sub-satellite track), "orbit" (the
+    # 3D ring), "both", or "none".
+    "satellite_trail": "ground",
+    # Minutes of orbit drawn on either side of now.  The ISS period is
+    # about 93 minutes, so 46 gives one full revolution.
+    "satellite_trail_minutes": "46",
+    # Draw the region from which the satellite is above the horizon.
+    # Off by default: near the limb xplanet does not occlude the far half
+    # of the circle, so it can appear to float outside the globe.
+    "satellite_footprint": "0",
+    # Append height and speed to the label.
+    "satellite_telemetry": "1",
+    # Label size, as a fraction of the monitor's shorter side.
+    "satellite_label_scale": "0.018",
+    # Refetch TLEs at most this often.  They age gracefully; six hours
+    # keeps the ISS within a few kilometres.
+    "tle_refresh_hours": "6",
+}
+
+GIBS_WMS = ("https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
+            "?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap"
+            "&LAYERS=VIIRS_SNPP_CorrectedReflectance_TrueColor"
+            "&CRS=CRS:84&BBOX=-180,-90,180,90"
+            "&WIDTH={w}&HEIGHT={h}&FORMAT=image/jpeg&TIME={date}")
+GIBS_TILE = ("https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/"
+             "VIIRS_SNPP_CorrectedReflectance_TrueColor/default/{date}/"
+             "250m/2/1/0.jpeg")
+
+MAP_W, MAP_H = 4096, 2048
+MARBLE = "/usr/share/xplanet/images/earth.jpg"
+NIGHT = "/usr/share/xplanet/images/night.jpg"
+USER_AGENT = "xplanet-wall/1.0 (+contrib/gnome)"
+
+CELESTRAK_TLE = ("https://celestrak.org/NORAD/elements/gp.php"
+                 "?CATNR={norad}&FORMAT=tle")
+EARTH_RADIUS_KM = 6378.137
+EARTH_MU = 398600.4418          # km^3/s^2
+SATELLITE_COLORS = (
+    (255, 196, 110),            # amber
+    (150, 210, 255),            # ice blue
+    (190, 255, 170),            # pale green
+    (255, 160, 190),            # rose
+)
+
+
+# --- small helpers --------------------------------------------------------
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def read_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                cfg[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def load_state(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path: str, state: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, path)
+
+
+def http_get(url: str, timeout: int = 90, byte_range: str | None = None) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    if byte_range:
+        req.add_header("Range", byte_range)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def write_text_atomic(path: str, body: str) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.replace(tmp, path)
+
+
+# --- satellite layer ------------------------------------------------------
+
+def tle_cache_path(cache_dir: str, norad: int) -> str:
+    return os.path.join(cache_dir, "tle", f"{norad}.tle")
+
+
+def tle_checksum_ok(line: str) -> bool:
+    """TLE lines end in a mod-10 checksum of the preceding 68 characters."""
+    if len(line) < 69 or not line[68].isdigit():
+        return False
+    total = 0
+    for char in line[:68]:
+        if char.isdigit():
+            total += int(char)
+        elif char == "-":
+            total += 1
+    return total % 10 == int(line[68])
+
+
+def parse_tle(text: str, norad: int) -> dict | None:
+    """Return the first complete, checksum-valid TLE for *norad*."""
+    lines = [line.rstrip("\r").rstrip() for line in text.splitlines()]
+    for i in range(len(lines) - 2):
+        name, one, two = lines[i], lines[i + 1], lines[i + 2]
+        if not (one.startswith("1 ") and two.startswith("2 ")):
+            continue
+        try:
+            if int(one[2:7]) != norad or int(two[2:7]) != norad:
+                continue
+        except ValueError:
+            continue
+        if not (tle_checksum_ok(one) and tle_checksum_ok(two)):
+            continue
+        return {
+            "norad": norad,
+            "name": name.strip() or f"NORAD {norad}",
+            "line1": one,
+            "line2": two,
+        }
+    return None
+
+
+def tle_epoch(line1: str) -> dt.datetime:
+    """Epoch of the elements, as an aware UTC datetime."""
+    yy = int(line1[18:20])
+    day = float(line1[20:32])
+    year = 2000 + yy if yy < 57 else 1900 + yy
+    return (dt.datetime(year, 1, 1, tzinfo=dt.UTC)
+            + dt.timedelta(days=day - 1))
+
+
+def tle_orbit(line2: str) -> tuple[float, float] | None:
+    """Mean altitude (km) and speed (km/s), from the mean motion."""
+    try:
+        rev_per_day = float(line2[52:63])
+    except ValueError:
+        return None
+    if rev_per_day <= 0:
+        return None
+    n = rev_per_day * 2.0 * math.pi / 86400.0       # rad/s
+    semi_major = (EARTH_MU / (n * n)) ** (1.0 / 3.0)
+    return semi_major - EARTH_RADIUS_KM, math.sqrt(EARTH_MU / semi_major)
+
+
+def read_tle(path: str, norad: int) -> dict | None:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            record = parse_tle(fh.read(), norad)
+    except OSError:
+        return None
+    if record is None:
+        return None
+    record["path"] = path
+    record["epoch"] = tle_epoch(record["line1"])
+    orbit = tle_orbit(record["line2"])
+    if orbit is not None:
+        record["altitude"], record["speed"] = orbit
+    return record
+
+
+def fetch_tle(cache_dir: str, norad: int, max_age_hours: float,
+              offline: bool = False) -> dict | None:
+    """Return a TLE, refreshing it from Celestrak when it is stale.
+
+    If a refresh fails, the cached copy is kept and its mtime is bumped so
+    a dead network does not mean a request every five minutes.
+    """
+    path = tle_cache_path(cache_dir, norad)
+    cached = read_tle(path, norad)
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        age = float("inf")
+    if cached is not None and age < max_age_hours * 3600:
+        return cached
+    if offline:
+        return cached
+
+    url = CELESTRAK_TLE.format(norad=norad)
+    log(f"fetching TLE for {norad}")
+    try:
+        text = http_get(url, timeout=40).decode("utf-8", "replace")
+    except Exception as exc:        # noqa: BLE001 - network trouble
+        log(f"warning: TLE download failed for {norad}: {exc}")
+        if cached is not None:
+            os.utime(path, None)
+        return cached
+
+    record = parse_tle(text, norad)
+    if record is None:
+        log(f"warning: no valid TLE for {norad} in the Celestrak reply")
+        if cached is not None:
+            os.utime(path, None)
+        return cached
+
+    ensure_dir(os.path.dirname(path))
+    write_text_atomic(
+        path, f"{record['name']}\n{record['line1']}\n{record['line2']}\n")
+    record["path"] = path
+    record["epoch"] = tle_epoch(record["line1"])
+    orbit = tle_orbit(record["line2"])
+    if orbit is not None:
+        record["altitude"], record["speed"] = orbit
+    return record
+
+
+def collect_satellites(cache_dir: str, cfg: dict,
+                       offline: bool = False) -> list[dict]:
+    spec = (cfg.get("satellites") or "").strip()
+    if not spec:
+        return []
+    try:
+        refresh_hours = float(cfg.get("tle_refresh_hours", "6"))
+    except ValueError:
+        refresh_hours = 6.0
+    out: list[dict] = []
+    for token in spec.replace(";", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            norad = int(token)
+        except ValueError:
+            log(f"warning: not a NORAD catalogue number: {token}")
+            continue
+        record = fetch_tle(cache_dir, norad, refresh_hours,
+                           offline=offline)
+        if record is None:
+            log(f"warning: no TLE available for {norad}, skipping")
+            continue
+        now = dt.datetime.now(dt.UTC)
+        record["age_hours"] = (now - record["epoch"]).total_seconds() / 3600
+        if record["age_hours"] > 7 * 24:
+            log(f"warning: TLE for {norad} is "
+                f"{record['age_hours'] / 24:.0f} days old")
+        out.append(record)
+    return out
+
+
+def write_satellite_set(cache_dir: str, entries: list[dict],
+                        size: tuple[int, int], cfg: dict) -> str | None:
+    """Write <base>.tle plus the matching xplanet satellite file.
+
+    xplanet looks for a drawing file and, separately, "<drawing file>.tle".
+    Font size and line thickness are in output pixels, so one drawing file
+    is written per monitor size.
+    """
+    if not entries:
+        return None
+
+    width, height = size
+    short = min(width, height)
+    try:
+        label_scale = float(cfg.get("satellite_label_scale", "0.018"))
+    except ValueError:
+        label_scale = 0.018
+    fontsize = max(10, round(short * label_scale))
+    thickness = max(2, round(short / 600))
+    footprint_thickness = max(1, thickness // 2)
+    try:
+        minutes = abs(int(cfg.get("satellite_trail_minutes", "46")))
+    except ValueError:
+        minutes = 46
+    mode = (cfg.get("satellite_trail") or "").strip().lower()
+    footprint = cfg.get("satellite_footprint", "0") == "1"
+    telemetry = cfg.get("satellite_telemetry", "1") == "1"
+    # "trail={...,0,0}" draws no arc (start == end) but sets the radius
+    # the marker is drawn at: on the surface for a ground track, at
+    # altitude when the orbit ring is shown.
+    marker_frame = "orbit" if mode in ("orbit", "both") else "ground"
+    marker_trail = f"{{{marker_frame},0,0,1}}"
+
+    directory = ensure_dir(os.path.join(cache_dir, "satellites"))
+    base = f"live-{width}x{height}"
+    sat_path = os.path.join(directory, base)
+    tle_path = sat_path + ".tle"
+
+    write_text_atomic(tle_path, "".join(
+        f"{entry['name']}\n{entry['line1']}\n{entry['line2']}\n"
+        for entry in entries))
+
+    lines: list[str] = []
+    for index, entry in enumerate(entries):
+        red, green, blue = SATELLITE_COLORS[index % len(SATELLITE_COLORS)]
+        # Braces are the syntax xplanet's colour parser accepts for RGB;
+        # a bare "r,g,b" is treated as a colour name and falls back to red.
+        color = f"{{{red},{green},{blue}}}"
+        label = (entry["name"].replace('"', "'")
+                 .replace("{", "(").replace("}", ")"))
+        if telemetry and "altitude" in entry:
+            label += (f" | {entry['altitude']:.0f} km"
+                      f" | {entry['speed']:.2f} km/s")
+        lines.append(f'{entry["norad"]} "{label}" color={color} '
+                     f'fontsize={fontsize} align=left '
+                     f'trail={marker_trail}')
+        if footprint:
+            dim = (red // 2 + 60, green // 2 + 60, blue // 2 + 60)
+            dim_color = f"{{{dim[0]},{dim[1]},{dim[2]}}}"
+            # No trail here: a ground trail would zero the radius and
+            # collapse the horizon circle.
+            lines.append(f'{entry["norad"]} "" image=none altcirc=0 '
+                         f'color={dim_color} '
+                         f'thickness={footprint_thickness}')
+        if minutes > 0 and mode in ("ground", "both"):
+            lines.append(f'{entry["norad"]} "" image=none '
+                         f'trail={{ground,-{minutes},{minutes},1}} '
+                         f'color={color} thickness={thickness}')
+        if minutes > 0 and mode in ("orbit", "both"):
+            lines.append(f'{entry["norad"]} "" image=none '
+                         f'trail={{orbit,-{minutes},{minutes},1}} '
+                         f'color={color} thickness={max(1, thickness - 1)}')
+
+    write_text_atomic(sat_path, "\n".join(lines) + "\n")
+    return sat_path
+
+
+# --- NASA GIBS ------------------------------------------------------------
+
+def tile_exists(date: str) -> bool:
+    """Cheap probe: one 1 KiB slice of a WMTS tile. 404 => no imagery."""
+    try:
+        data = http_get(GIBS_TILE.format(date=date), timeout=20,
+                        byte_range="bytes=0-1023")
+        return len(data) > 0
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 403):
+            return False
+        raise
+    except (urllib.error.URLError, TimeoutError):
+        raise
+
+
+def latest_date(cache_dir: str, max_age_days: int) -> str | None:
+    """Find the newest date GIBS actually has, remembering the answer.
+
+    NASA runs behind: today's mosaic usually is not published yet, and the
+    gap can be days.  We never assume -- we probe.
+    """
+    state_path = os.path.join(cache_dir, "state.json")
+    state = load_state(state_path)
+    today = dt.date.today()
+    known = state.get("date")
+
+    best = known
+    if known:
+        # Fast path: walk forward from the remembered date until the gap.
+        try:
+            nxt = dt.date.fromisoformat(known) + dt.timedelta(days=1)
+        except ValueError:
+            nxt = today + dt.timedelta(days=1)
+        while nxt <= today:
+            try:
+                if not tile_exists(nxt.isoformat()):
+                    break
+            except Exception as exc:    # noqa: BLE001 - network trouble
+                log(f"warning: GIBS probe failed for {nxt}: {exc}")
+                return best
+            best = nxt.isoformat()
+            nxt += dt.timedelta(days=1)
+        if best == known:
+            return best                 # nothing newer published yet
+    else:
+        # First run: NASA lags, so scan backwards for the newest real date.
+        for back in range(max_age_days):
+            day = today - dt.timedelta(days=back)
+            try:
+                found = tile_exists(day.isoformat())
+            except Exception as exc:    # noqa: BLE001 - network trouble
+                log(f"warning: GIBS probe failed for {day}: {exc}")
+                return None
+            if found:
+                best = day.isoformat()
+                break
+
+    if best:
+        state["date"] = best
+        state["checked"] = int(time.time())
+        save_state(state_path, state)
+    return best
+
+
+def fetch_mosaic(cache_dir: str, date: str) -> str | None:
+    path = os.path.join(cache_dir, "maps", f"viirs-{date}.jpg")
+    if os.path.exists(path) and os.path.getsize(path) > 100_000:
+        return path
+    ensure_dir(os.path.dirname(path))
+    url = GIBS_WMS.format(w=MAP_W, h=MAP_H, date=date)
+    log(f"downloading VIIRS mosaic for {date} ({MAP_W}x{MAP_H})")
+    try:
+        data = http_get(url, timeout=180)
+    except Exception as exc:        # noqa: BLE001
+        log(f"warning: mosaic download failed: {exc}")
+        return None
+    if len(data) < 100_000 or data[:2] != b"\xff\xd8":
+        log("warning: mosaic download looked empty or not a JPEG")
+        return None
+    tmp = path + ".part"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp, path)
+    return path
+
+
+# --- map preparation ------------------------------------------------------
+
+def hole_fraction(path: str) -> float:
+    """Fraction of the mosaic with no sensor data, measured on a thumbnail."""
+    import numpy as np
+    from PIL import Image
+
+    img = Image.open(path).convert("RGB")
+    img.thumbnail((1024, 512))
+    return float((np.asarray(img).max(axis=2) <= 8).mean())
+
+
+def choose_mosaic(cache_dir: str, newest: str, cfg: dict) -> tuple[str, str]:
+    """Newest mosaic whose coverage is good enough. Returns (date, path).
+
+    GIBS publishes a date as soon as *some* imagery exists, so the newest
+    date can be a partial ingest missing whole continents.  Walk back until
+    a usable day is found; keep the least-bad one as a fallback.
+    """
+    state_path = os.path.join(cache_dir, "state.json")
+    state = load_state(state_path)
+    bad = state.get("bad", {})
+    ttl = float(cfg["bad_ttl_hours"]) * 3600
+    limit = float(cfg["max_holes"])
+    now = time.time()
+
+    day = dt.date.fromisoformat(newest)
+    best: tuple[str, str, float] | None = None
+    for _ in range(int(cfg["max_candidates"])):
+        iso = day.isoformat()
+        marked = bad.get(iso)
+        if marked is not None and now - marked < ttl:
+            log(f"skipping {iso} (rejected as incomplete recently)")
+            day -= dt.timedelta(days=1)
+            continue
+
+        path = fetch_mosaic(cache_dir, iso)
+        if path is not None:
+            frac = hole_fraction(path)
+            log(f"mosaic {iso}: {frac * 100:.1f}% no-data")
+            if best is None or frac < best[2]:
+                best = (iso, path, frac)
+            if frac <= limit:
+                state["chosen"] = iso
+                state["chosen_holes"] = round(frac, 4)
+                state["bad"] = bad
+                save_state(state_path, state)
+                return iso, path
+            bad[iso] = now
+        day -= dt.timedelta(days=1)
+
+    state["bad"] = bad
+    save_state(state_path, state)
+    if best is not None:
+        # Nothing clean enough; show the best real imagery we have.
+        state["chosen"] = best[0]
+        state["chosen_holes"] = round(best[2], 4)
+        save_state(state_path, state)
+        return best[0], best[1]
+    raise RuntimeError("no usable mosaic")
+
+
+def prepare_maps(cache_dir: str, mosaic: str | None) -> tuple[str, str]:
+    """Return (day_map, night_map), both MAP_W x MAP_H, cached by date."""
+    import numpy as np
+    from PIL import Image
+
+    if mosaic is None:
+        return MARBLE, NIGHT
+
+    tag = os.path.basename(mosaic).rsplit(".", 1)[0]
+    day_path = os.path.join(cache_dir, "maps", f"day-{tag}.jpg")
+    night_path = os.path.join(cache_dir, "maps", f"night-{tag}.jpg")
+    if os.path.exists(day_path) and os.path.exists(night_path):
+        return day_path, night_path
+
+    ensure_dir(os.path.dirname(day_path))
+    nasa = Image.open(mosaic).convert("RGB")
+    base = Image.open(MARBLE).convert("RGB")
+    if nasa.size != (MAP_W, MAP_H):
+        nasa = nasa.resize((MAP_W, MAP_H), Image.LANCZOS)
+    if base.size != nasa.size:
+        base = base.resize(nasa.size, Image.LANCZOS)
+
+    a = np.asarray(nasa)
+    b = np.asarray(base)
+    # Polar night and missing granules come back pure black.  Everything the
+    # sensor did not see falls back to the static Blue Marble underneath.
+    holes = a.max(axis=2) <= 8
+    filled = np.where(holes[:, :, None], b, a)
+    Image.fromarray(filled.astype(np.uint8), "RGB").save(
+        day_path + ".part", format="JPEG", quality=90, subsampling=1)
+    os.replace(day_path + ".part", day_path)
+    log(f"day map: {holes.mean() * 100:.1f}% filled from Blue Marble")
+
+    night = Image.open(NIGHT).convert("RGB").resize(nasa.size, Image.LANCZOS)
+    night.save(night_path + ".part", format="JPEG", quality=92)
+    os.replace(night_path + ".part", night_path)
+    return day_path, night_path
+
+
+# --- monitor geometry -----------------------------------------------------
+
+DISPLAY_SIG = ("(ua((ssss)a(siiddada{sv})a{sv})"
+               "a(iiduba(ssss)a{sv})a{sv})")
+
+
+def monitor_sizes() -> list[tuple[int, int]]:
+    """Distinct logical monitor sizes, e.g. [(1080,1920), (3840,2160)]."""
+    try:
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        out = bus.call_sync(
+            "org.gnome.Mutter.DisplayConfig",
+            "/org/gnome/Mutter/DisplayConfig",
+            "org.gnome.Mutter.DisplayConfig",
+            "GetCurrentState", None,
+            GLib.VariantType.new(DISPLAY_SIG),
+            Gio.DBusCallFlags.NONE, -1, None)
+        _serial, monitors, logical, _props = out.unpack()
+    except Exception as exc:        # noqa: BLE001
+        log(f"warning: cannot query Mutter display config: {exc}")
+        return [(3840, 2160), (1920, 1200), (1080, 1920)]
+
+    mode_of = {}
+    for (conn, _vendor, _product, _serial), modes, _mprops in monitors:
+        current = [m for m in modes if m[6].get("is-current")]
+        if current:
+            mode_of[conn] = (int(current[0][1]), int(current[0][2]))
+
+    sizes = set()
+    for _x, _y, scale, transform, _primary, specs, _lprops in logical:
+        if not specs:
+            continue
+        conn = specs[0][0]
+        if conn not in mode_of:
+            continue
+        w, h = mode_of[conn]
+        if int(transform) in (1, 3):        # 90 / 270 degrees
+            w, h = h, w
+        scale = float(scale) or 1.0
+        sizes.add((round(w / scale), round(h / scale)))
+    return sorted(sizes)
+
+
+def view_longitude(cfg: dict) -> float:
+    if cfg["longitude"] != "auto":
+        return float(cfg["longitude"])
+    offset = -time.timezone if time.localtime().tm_isdst == 0 \
+        else -time.altzone
+    return 15.0 * (offset / 3600.0)
+
+
+# --- rendering ------------------------------------------------------------
+
+def write_xplanet_conf(cache_dir: str, day_map: str, night_map: str,
+                       size: tuple[int, int], satellites: list[dict],
+                       cfg: dict) -> str:
+    sat_file = write_satellite_set(cache_dir, satellites, size, cfg)
+    body = (
+        '[earth]\n'
+        '"Earth"\n'
+        f'map={day_map}\n'
+        f'night_map={night_map}\n'
+        'shade=70\n'
+        'twilight=12\n'
+        'cloud_threshold=90\n'
+    )
+    if sat_file is not None:
+        body += f'satellite_file={sat_file}\n'
+    path = os.path.join(cache_dir, f"xplanet-{size[0]}x{size[1]}.conf")
+    write_text_atomic(path, body)
+    return path
+
+
+def render(size: tuple[int, int], conf: str, cfg: dict,
+           out_path: str) -> bool:
+    width, height = size
+    scale = float(cfg["scale"])
+    radius = 100.0 * (scale / 2.0) * min(width, height) / height
+    cmd = [
+        "xplanet",
+        "-config", conf,
+        "-output", out_path,
+        "-geometry", f"{width}x{height}",
+        "-origin", "earth",
+        "-longitude", f"{view_longitude(cfg):.3f}",
+        "-latitude", cfg["latitude"],
+        "-radius", f"{radius:.3f}",
+        "-num_times", "1",
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=180,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        detail = exc.stderr.decode(errors="replace").strip() if exc.stderr else ""
+        log(f"error: xplanet failed for {width}x{height}: {detail or exc}")
+        return False
+    return os.path.exists(out_path) and os.path.getsize(out_path) > 1000
+
+
+def prune(directory: str, keep: int) -> None:
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith(".png"))
+    except FileNotFoundError:
+        return
+    for name in names[:-keep] if keep > 0 else []:
+        try:
+            os.unlink(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
+def publish(cache_dir: str, size: tuple[int, int], src: str) -> str:
+    directory = ensure_dir(
+        os.path.join(cache_dir, "frames", f"{size[0]}x{size[1]}"))
+    # Zero-padded so lexicographic order equals chronological order.
+    name = f"{int(time.time()):011d}.png"
+    dst = os.path.join(directory, name)
+    os.replace(src, dst)            # atomic within the same filesystem
+    return dst
+
+
+# --- main -----------------------------------------------------------------
+
+def main() -> int:
+    global CONFIG_PATH
+
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--cache-dir", default=CACHE_DIR)
+    ap.add_argument("--config", default=CONFIG_PATH)
+    ap.add_argument("--monitors", default="",
+                    help="override monitor sizes, e.g. 3840x2160,1080x1920")
+    ap.add_argument("--list-monitors", action="store_true",
+                    help="print detected monitor sizes and exit")
+    ap.add_argument("--status", action="store_true",
+                    help="print cache/mosaic state and exit")
+    ap.add_argument("--no-network", action="store_true",
+                    help="skip downloads (Blue Marble and cached TLEs only)")
+    ap.add_argument("--satellites", default=None,
+                    help="override the configured NORAD IDs, e.g. 25544; "
+                         "an empty string disables the layer")
+    args = ap.parse_args()
+
+    CONFIG_PATH = args.config
+    cfg = read_config()
+    if args.satellites is not None:
+        cfg["satellites"] = args.satellites
+
+    override = args.monitors or cfg.get("monitors", "")
+    if override:
+        sizes = []
+        for item in override.split(","):
+            w, h = item.lower().split("x")
+            sizes.append((int(w), int(h)))
+    else:
+        sizes = monitor_sizes()
+
+    if args.list_monitors:
+        for w, h in sizes:
+            print(f"{w}x{h}")
+        return 0
+
+    cache_dir = args.cache_dir
+    ensure_dir(cache_dir)
+
+    if args.status:
+        state = load_state(os.path.join(cache_dir, "state.json"))
+        print(f"cache dir   : {cache_dir}")
+        print(f"newest date : {state.get('date', '(never probed)')}")
+        chosen = state.get("chosen")
+        if chosen:
+            holes = float(state.get("chosen_holes") or 0)
+            print(f"in use      : {chosen} ({holes * 100:.1f}% no-data)")
+        rejected = sorted((state.get("bad") or {}).keys())
+        if rejected:
+            print(f"rejected    : {', '.join(rejected)}")
+        spec = (cfg.get("satellites") or "").strip()
+        if spec:
+            print(f"satellites  : {spec}")
+            print(f"  layer     : trail={cfg.get('satellite_trail', 'ground')} "
+                  f"+-{cfg.get('satellite_trail_minutes', '0')} min, "
+                  f"footprint={cfg.get('satellite_footprint', '0')}, "
+                  f"telemetry={cfg.get('satellite_telemetry', '1')}")
+            now = dt.datetime.now(dt.UTC)
+            for token in spec.replace(";", ",").split(","):
+                token = token.strip()
+                if not token.isdigit():
+                    continue
+                record = read_tle(tle_cache_path(cache_dir, int(token)),
+                                  int(token))
+                if record is None:
+                    print(f"  {token:<9} : no cached TLE")
+                    continue
+                age = (now - record["epoch"]).total_seconds() / 3600
+                extra = ""
+                if "altitude" in record:
+                    extra = (f", {record['altitude']:.0f} km, "
+                             f"{record['speed']:.2f} km/s")
+                print(f"  {token:<9} : {record['name']}")
+                print(f"              TLE epoch {record['epoch']:%Y-%m-%d %H:%M}Z"
+                      f" ({age:.1f} h old){extra}")
+        maps = os.path.join(cache_dir, "maps")
+        if os.path.isdir(maps):
+            for name in sorted(os.listdir(maps)):
+                size = os.path.getsize(os.path.join(maps, name))
+                print(f"  map       : {name} ({size // 1024} KiB)")
+        frames = os.path.join(cache_dir, "frames")
+        if os.path.isdir(frames):
+            for d in sorted(os.listdir(frames)):
+                files = sorted(os.listdir(os.path.join(frames, d)))
+                print(f"  frames    : {d} ({len(files)} kept)")
+        return 0
+
+    use_viirs = cfg.get("use_viirs", "1") == "1" and not args.no_network
+    mosaic = None
+    if use_viirs:
+        newest = latest_date(cache_dir, int(cfg["max_age_days"]))
+        if newest:
+            try:
+                date, mosaic = choose_mosaic(cache_dir, newest, cfg)
+                log(f"using imagery from {date}")
+            except RuntimeError as exc:
+                log(f"warning: {exc}")
+        if mosaic is None:
+            log("falling back to Blue Marble")
+
+    try:
+        day_map, night_map = prepare_maps(cache_dir, mosaic)
+    except ImportError:
+        log("warning: Pillow missing, using Blue Marble unprocessed")
+        day_map, night_map = MARBLE, NIGHT
+
+    satellites = collect_satellites(cache_dir, cfg, offline=args.no_network)
+    if satellites:
+        log("satellites: " + ", ".join(
+            f"{s['norad']} {s['name']} (TLE {s['age_hours']:.0f} h old)"
+            for s in satellites))
+
+    workdir = tempfile.mkdtemp(prefix="xplanet-wall-", dir=cache_dir)
+    ok = 0
+    try:
+        for size in sizes:
+            conf = write_xplanet_conf(cache_dir, day_map, night_map, size,
+                                      satellites, cfg)
+            tmp = os.path.join(workdir, f"{size[0]}x{size[1]}.png")
+            if not render(size, conf, cfg, tmp):
+                continue
+            os.chmod(tmp, 0o644)
+            publish(cache_dir, size, tmp)
+            prune(os.path.join(cache_dir, "frames", f"{size[0]}x{size[1]}"),
+                  int(cfg["keep"]))
+            ok += 1
+            log(f"rendered {size[0]}x{size[1]}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

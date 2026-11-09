@@ -1,0 +1,7 @@
+{
+  "uuid": "xplanet-wall@petro",
+  "name": "xplanet Live Earth",
+  "description": "Live satellite view of Earth as the desktop background. Renders are produced by xplanet from NASA VIIRS imagery; this extension displays the newest frame on every monitor, keeping each screen's aspect ratio.",
+  "shell-version": ["50"],
+  "version": 1
+}

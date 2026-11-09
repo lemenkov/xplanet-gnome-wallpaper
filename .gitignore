@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+
+# Python bytecode, caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local caches and scratch files, when --cache-dir points into the tree
+/.cache/
+*.part
+*.tmp
+
+# GNOME Shell extension packaging output
+*.shell-extension.zip
+
+# Editor and OS cruft
+*~
+*.swp
+.DS_Store

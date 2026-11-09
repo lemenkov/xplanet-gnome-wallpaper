@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
+# SPDX-License-Identifier: CC0-1.0
+
+version = 1
+
+[[annotations]]
+path = "extension/metadata.json"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 Peter Lemenkov"
+SPDX-License-Identifier = "Apache-2.0"
